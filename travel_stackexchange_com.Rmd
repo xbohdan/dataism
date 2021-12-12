@@ -1,0 +1,664 @@
+---
+title: "Travel Stack Exchange"
+subtitle: "Data Processing in R and Python"
+author: "cutieskye"
+date: 2021-12-12
+output: html_document
+---
+
+---
+
+## Introduction
+
+The project aims to analyze the [Travel Stack Exchange](https://travel.stackexchange.com/) simplified anonymized data dump of user-contributed content.
+
+
+For each query, a reference SQL statement is provided via the `sqldf` package. I will explore the data further with base R functions, `dplyr` and `data.table` packages. Note that SQL follows the declarative paradigm, and in R, we give explicit instructions. So, my goal is to reproduce the final result rather than mimic the SQL query execution flow.
+
+I import libraries necessary for data frame manipulation in the first code chunk. I also enable caching globally to improve performance (ensuring proper dependencies), switch to the directory with the data, and disable the automatic string to factor conversion. I set a time zone to UTC to avoid warnings produced by date-time functions. Package loading messages will not be displayed.
+
+```{r setup, message = FALSE, warning = FALSE}
+library(sqldf)
+library(dplyr)
+library(data.table)
+
+knitr::opts_chunk$set(cache = TRUE)
+knitr::opts_knit$set(root.dir = "~/pd1/travel_stackexchange_com")
+
+options(stringsAsFactors = FALSE)
+
+Sys.setenv(TZ = "UTC")
+```
+
+Now it is time to load the data.
+
+```{r data}
+Badges <- read.csv("Badges.csv.gz")
+Comments <- read.csv("Comments.csv.gz")
+PostLinks <- read.csv("PostLinks.csv.gz")
+Posts <- read.csv("Posts.csv.gz")
+Tags <- read.csv("Tags.csv.gz")
+Users <- read.csv("Users.csv.gz")
+Votes <- read.csv("Votes.csv.gz")
+```
+
+To prove that my solution is correct, I will compare each query with the reference solution using the following function:
+
+```{r areEquivalent, dependson = "data"}
+AreEquivalent <- function(sqldf0, base0, dplyr0, dataTable0) {
+  result <- all(
+    all_equal(sqldf0, base0),
+    all_equal(sqldf0, dplyr0),
+    all_equal(sqldf0, dataTable0),
+    compare::compare(sqldf0, base0, allowAll = TRUE)$result,
+    compare::compare(sqldf0, as.data.frame(dplyr0), allowAll = TRUE)$result,
+    compare::compare(sqldf0, as.data.frame(dataTable0), allowAll = TRUE)$result
+  )
+  return(result)
+}
+```
+
+---
+
+## Query 1
+
+We are interested in the ten most frequent names of badges and classes they belong to.
+
+```{r sqldf1, dependson = "data"}
+Sqldf1 <- function() {
+  sqldf1 <- sqldf(
+    "
+      SELECT
+        Name,
+        COUNT(*) AS Number,
+        MIN(Class) AS BestClass
+      FROM Badges
+      GROUP BY Name
+      ORDER BY Number DESC
+      LIMIT 10
+    "
+  )
+  return(sqldf1)
+}
+
+Sqldf1()
+```
+
+Every query follows the same layout. The three code chunks contain only functions from specific libraries.
+
+```{r base1, dependson = "data"}
+Base1 <- function() {
+  base1 <-
+    aggregate(Badges$Name, by = list(Badges$Name), FUN = length)
+  colnames(base1) <- c("Name", "Number")
+  temp1 <-
+    aggregate(Badges$Class, by = list(Badges$Name), FUN = min)
+  colnames(temp1) <- c("Name", "BestClass")
+  base1 <- merge(base1, temp1)
+  base1 <-
+    head(base1[order(base1$Number, decreasing = TRUE),], 10)
+  return(base1)
+}
+```
+
+```{r dplyr1, dependson = "data"}
+Dplyr1 <- function() {
+  dplyr1 <- Badges %>%
+    group_by(Name) %>%
+    summarize(Number = length(Name),
+              BestClass = min(Class)) %>%
+    arrange(desc(Number)) %>%
+    slice_head(n = 10)
+  return(dplyr1)
+}
+```
+
+```{r dataTable1, dependson = "data"}
+DataTable1 <- function() {
+  badges <- as.data.table(Badges)
+  dataTable1 <- badges[, .(Number = length(Class)), by = Name]
+  setkey(dataTable1, Name)
+  temp1 <- badges[, .(BestClass = min(Class)), by = Name]
+  setkey(temp1, Name)
+  dataTable1 <- head(dataTable1[temp1][order(-Number)], 10)
+  return(dataTable1)
+}
+```
+
+I cross-check the results to ensure that the output matches (it may be permuted differently).
+
+```{r eq1, dependson = c("areEquivalent", "sqldf1", "base1", "dplyr1", "dataTable1")}
+AreEquivalent(Sqldf1(), Base1(), Dplyr1(), DataTable1())
+```
+
+Additionally, I measure the time it takes to evaluate every implementation of the query above.
+
+```{r exec1, dependson = c("sqldf1", "base1", "dplyr1", "dataTable1")}
+microbenchmark::microbenchmark(sqldf = Sqldf1(), base = Base1(),
+               dplyr = Dplyr1(), dataTable = DataTable1(), times = 10)
+```
+
+---
+
+## Query 2
+
+We would like to know the top ten locations where most website users are (if this field is nonempty) and how many of them are there.
+
+```{r sqldf2, dependson = "data"}
+Sqldf2 <- function() {
+  sqldf2 <- sqldf(
+    "
+      SELECT Location, COUNT(*) AS Count
+      FROM (
+        SELECT Posts.OwnerUserId, Users.Id, Users.Location
+        FROM Users
+        JOIN Posts ON Users.Id = Posts.OwnerUserId
+      )
+      WHERE Location NOT IN ('')
+      GROUP BY Location
+      ORDER BY Count DESC
+      LIMIT 10
+    "
+  )
+  return(sqldf2)
+}
+
+Sqldf2()
+```
+
+Observe that *OwnerUserId* and *Id* from the subquery are not used later. The general advice is to select only the columns you need. So whenever I meet such redundant columns, I will drop them.
+
+```{r base2, dependson = "data"}
+Base2 <- function() {
+  base2 <-
+    merge(Users, Posts, by.x = "Id", by.y = "OwnerUserId")$Location
+  base2 <- as.data.frame(table(base2[base2 != ""]))
+  base2 <- head(base2[order(base2$Freq, decreasing = TRUE),], 10)
+  base2 <- setNames(base2, c("Location", "Count"))
+  base2$Location <- as.character(base2$Location)
+  return(base2)
+}
+```
+
+```{r dplyr2, dependson = "data"}
+Dplyr2 <- function() {
+  dplyr2 <- Users %>%
+    inner_join(Posts, by = c("Id" = "OwnerUserId")) %>%
+    filter(Location != "") %>%
+    group_by(Location) %>%
+    summarize(Count = length(Location)) %>%
+    arrange(desc(Count)) %>%
+    slice_head(n = 10)
+  return(dplyr2)
+}
+```
+
+```{r dataTable2, dependson = "data"}
+DataTable2 <- function() {
+  users <- as.data.table(Users)
+  setkey(users, "Id")
+  posts <- as.data.table(Posts)
+  setkey(posts, OwnerUserId)
+  dataTable2 <- head(users[posts, nomatch = 0
+                            ][Location != "", .(Count = .N), by = Location
+                              ][order(-Count)
+                                ], 10)
+  return(dataTable2)
+}
+```
+
+```{r eq2, dependson = c("areEquivalent", "sqldf2", "base2", "dplyr2", "dataTable2")}
+AreEquivalent(Sqldf2(), Base2(), Dplyr2(), DataTable2())
+```
+
+```{r exec2, dependson = c("sqldf2", "base2", "dplyr2", "dataTable2")}
+microbenchmark::microbenchmark(sqldf = Sqldf2(), base = Base2(),
+               dplyr = Dplyr2(), dataTable = DataTable2(), times = 10)
+```
+
+---
+
+## Query 3
+
+The query below shows us the names, locations, and IDs of those ten users who give the most answers (on average).
+
+```{r sqldf3, dependson = "data"}
+Sqldf3 <- function() {
+  sqldf3 <- sqldf(
+    "
+      SELECT
+        Users.AccountId,
+        Users.DisplayName,
+        Users.Location,
+        AVG(PostAuth.AnswersCount) as AverageAnswersCount
+      FROM
+      (
+        SELECT
+          AnsCount.AnswersCount,
+          Posts.Id,
+          Posts.OwnerUserId
+        FROM (
+          SELECT Posts.ParentId, COUNT(*) AS AnswersCount
+          FROM Posts
+          WHERE Posts.PostTypeId = 2
+          GROUP BY Posts.ParentId
+        ) AS AnsCount
+        JOIN Posts ON Posts.Id = AnsCount.ParentId
+      ) AS PostAuth
+      JOIN Users ON Users.AccountId=PostAuth.OwnerUserId
+      GROUP BY OwnerUserId
+      ORDER BY AverageAnswersCount DESC
+      LIMIT 10
+    "
+  )
+  return(sqldf3)
+}
+
+Sqldf3()
+```
+
+We will often see columns that are neither arguments to aggregation functions nor appear in the `GROUP BY` clause. These are called "bare columns". Here, columns are grouped by *OwnerUserId*, so I perform the lookup of other user information using the same identifier.
+
+```{r base3, dependson = "data"}
+Base3 <- function() {
+  ansCount <- Posts[Posts["PostTypeId"] == 2, "ParentId"]
+  ansCount <- sapply(split(ansCount, ansCount), length)
+  ansCount <-
+    data.frame(ParentId = names(ansCount), AnswersCount = ansCount)
+  
+  postAuth <- merge(Posts, ansCount, by.x = "Id",
+                    by.y = "ParentId")[c("AnswersCount", "OwnerUserId")]
+  
+  base3 <-
+    merge(Users, postAuth, by.x = "AccountId", by.y = "OwnerUserId")
+  temp31 <-
+    aggregate(base3$AnswersCount,
+              by = list(base3$AccountId),
+              FUN = mean)
+  colnames(temp31) <- c("AccountId", "AverageAnswersCount")
+  temp32 <- base3[base3$AccountId %in% temp31$AccountId,
+                  c("AccountId", "DisplayName", "Location")]
+  base3 <- merge(temp32, temp31)
+  base3 <-
+    head(base3[order(base3$AverageAnswersCount, decreasing = TRUE), ], 10)
+  return(base3)
+}
+```
+
+We cant omit the *Id* column in *PostAuth* as it is not needed for its outer query. Moreover, *AccountId* and *UserOwnerId* can be used interchangeably because inner join (the default) returns rows if there is a match in both tables.
+
+```{r dplyr3, dependson = "data"}
+Dplyr3 <- function() {
+  ansCount <- Posts %>%
+    filter(PostTypeId == 2) %>%
+    group_by(ParentId) %>%
+    summarize(AnswersCount = length(ParentId))
+  
+  postAuth <- ansCount %>%
+    inner_join(Posts, by = c("ParentId" = "Id")) %>%
+    select(AnswersCount, OwnerUserId)
+  
+  dplyr3 <- postAuth %>%
+    inner_join(Users, by = c("OwnerUserId" = "AccountId")) %>%
+    group_by(OwnerUserId) %>%
+    filter(AnswersCount == mean(AnswersCount)) %>%
+    slice(n = 1) %>%
+    ungroup() %>%
+    select(AccountId = OwnerUserId,
+           DisplayName,
+           Location,
+           AverageAnswersCount = AnswersCount) %>%
+    arrange(desc(AverageAnswersCount)) %>%
+    slice_head(n = 10)
+  dplyr3$AverageAnswersCount <- as.double(dplyr3$AverageAnswersCount)
+  return(dplyr3)
+}
+```
+
+```{r dataTable3, dependson = "data"}
+DataTable3 <- function() {
+  posts <- as.data.table(Posts)
+  setkey(posts, Id)
+  ansCount <-
+    posts[PostTypeId == 2, .(ParentId, AnswersCount = .N), by = ParentId]
+  setkey(ansCount, ParentId)
+    
+  postAuth <-
+    ansCount[posts, nomatch = 0][, .(AnswersCount, OwnerUserId)]
+  setkey(postAuth, OwnerUserId)
+    
+  users <- as.data.table(Users)
+  setkey(users, AccountId)
+  dataTable3 <-
+    postAuth[users, nomatch = 0][, setnames(.SD, "OwnerUserId", "AccountId")]
+  temp31 <-
+    na.omit(dataTable3[,
+                        .(AverageAnswersCount = mean(AnswersCount)),
+                        by = AccountId
+                        ])
+  setkey(temp31, AccountId)
+  temp32 <-
+    dataTable3[AccountId %in% temp31[, AccountId],
+                .(AccountId, DisplayName, Location)
+                ]
+  setkey(temp32, AccountId)
+  dataTable3 <-
+    head(temp32[temp31][order(-AverageAnswersCount)], 10)
+  return(dataTable3)
+}
+```
+
+```{r eq3, dependson = c("areEquivalent", "sqldf3", "base3", "dplyr3", "dataTable3")}
+AreEquivalent(Sqldf3(), Base3(), Dplyr3(), DataTable3())
+```
+
+```{r exec3, dependson = c("sqldf3", "base3", "dplyr3", "dataTable3")}
+microbenchmark::microbenchmark(sqldf = Sqldf3(), base = Base3(),
+               dplyr = Dplyr3(), dataTable = DataTable3(), times = 10)
+```
+
+---
+
+## Query 4
+
+With this query, we can find the titles of the questions that had the most upvotes for each year.
+
+```{r sqldf4, dependson = "data"}
+Sqldf4 <- function() {
+  sqldf4 <- sqldf(
+    "
+      SELECT
+        Posts.Title,
+        UpVotesPerYear.Year,
+        MAX(UpVotesPerYear.Count) AS Count
+      FROM (
+        SELECT
+          PostId,
+          COUNT(*) AS Count,
+          STRFTIME('%Y', Votes.CreationDate) AS Year
+        FROM Votes
+        WHERE VoteTypeId=2
+        GROUP BY PostId, Year
+      ) AS UpVotesPerYear
+      JOIN Posts ON Posts.Id=UpVotesPerYear.PostId
+      WHERE Posts.PostTypeId=1
+      GROUP BY Year
+      ORDER BY Year ASC
+    "
+  )
+  return(sqldf4)
+}
+
+Sqldf4()
+```
+
+In aggregate queries with functions `MIN` or `MAX`, bare columns take values from the row which contains the minimum or maximum. So, for each year, I select the title corresponding to the row in which the number of votes is the largest.
+
+```{r base4, dependson = "data"}
+Base4 <- function() {
+  upVotesPerYear <-
+    Votes[Votes["VoteTypeId"] == 2, c("PostId", "CreationDate")]
+  upVotesPerYear["Year"] <-
+    lapply(upVotesPerYear["CreationDate"], substr, 1, 4)
+  upVotesPerYear <- subset(upVotesPerYear, select = -CreationDate)
+  upVotesPerYear <- aggregate(
+    upVotesPerYear$PostId,
+    by = list(upVotesPerYear$PostId, upVotesPerYear$Year),
+    FUN = length
+  )
+  upVotesPerYear <-
+    setNames(upVotesPerYear, c("PostId", "Year", "Count"))
+  
+  base4 <-
+    merge(upVotesPerYear, Posts[Posts["PostTypeId"] == 1,],
+          by.x = "PostId", by.y = "Id")[c("Title", "Year", "Count")]
+  base4 <- do.call(rbind, by(base4, list(base4$Year),
+                             function (x)
+                               x[which.max(x$Count),]))
+  base4 <- base4[order(base4$Year),]
+  return(base4)
+}
+```
+
+```{r dplyr4, dependson = "data"}
+Dplyr4 <- function() {
+  upVotesPerYear <- Votes %>%
+    filter(VoteTypeId == 2) %>%
+    mutate(Year = substr(CreationDate, 1, 4)) %>%
+    add_count(PostId, Year, name = "Count")
+  
+  dplyr4 <- upVotesPerYear %>%
+    inner_join(Posts, by = c("PostId" = "Id")) %>%
+    filter(PostTypeId == 1) %>%
+    group_by(Year) %>%
+    filter(Count == max(Count)) %>%
+    slice(n = 1) %>%
+    select(Title, Year, Count) %>%
+    arrange(Year)
+  return(dplyr4)
+}
+```
+
+I can change *CreationDate* to be treated as a proper date column and then extract the year from it. Still, the faster and more readable solution is to take just the first four characters of each string.
+
+```{r dataTable4, dependson = "data"}
+DataTable4 <- function() {
+  votes <- as.data.table(Votes)
+  upVotesPerYear <- votes[VoteTypeId == 2,
+                          .(PostId, CreationDate)
+                          ][, .(PostId, Year = format(
+                            as.POSIXct(CreationDate, format = "%Y-%m-%d"),
+                            "%Y"))
+                            ][, .(Count = .N), by = .(PostId, Year)
+                              ]
+  setkey(upVotesPerYear, PostId)
+  
+  posts = as.data.table(Posts)
+  setkey(posts, Id)
+  dataTable4 <-
+    upVotesPerYear[posts, nomatch = 0
+                   ][PostTypeId == 1, .(Title, Count, Year)
+                     ][, .SD[Count == max(Count)], by = Year]
+  return(dataTable4)
+}
+```
+
+```{r eq4, dependson = c("areEquivalent", "sqldf4", "base4", "dplyr4", "dataTable4")}
+AreEquivalent(Sqldf4(), Base4(), Dplyr4(), DataTable4())
+```
+
+```{r exec4, dependson = c("sqldf4", "base4", "dplyr4", "dataTable4")}
+microbenchmark::microbenchmark(sqldf = Sqldf4(), base = Base4(),
+               dplyr = Dplyr4(), dataTable = DataTable4(), times = 10)
+```
+
+---
+
+## Query 5
+
+We would like to see ten once highly upvoted topics that became irrelevant in the last two years. More specifically, such questions have many votes overall, but none comes from 2020 or 2021.
+
+```{r sqldf5, dependson = "data"}
+Sqldf5 <- function() {
+  sqldf5 <- sqldf(
+    "
+    SELECT
+      Posts.Title,
+      VotesByAge2.OldVotes
+    FROM Posts
+    JOIN (
+      SELECT
+        PostId,
+        MAX(CASE WHEN VoteDate = 'new'THEN Total ELSE 0 END) NewVotes,
+        MAX(CASE WHEN VoteDate = 'old'THEN Total ELSE 0 END) OldVotes,
+        SUM(Total) AS Votes
+      FROM (
+        SELECT
+          PostId,
+          CASE STRFTIME('%Y', CreationDate)
+            WHEN '2021'THEN 'new'
+            WHEN '2020'THEN 'new'
+            ELSE 'old'
+            END VoteDate,
+          COUNT(*) AS Total
+        FROM Votes
+        WHERE VoteTypeId IN (1, 2, 5)
+        GROUP BY PostId, VoteDate
+      ) AS VotesByAge
+      GROUP BY VotesByAge.PostId
+      HAVING NewVotes=0
+    ) AS VotesByAge2 ON VotesByAge2.PostId=Posts.ID
+    WHERE Posts.PostTypeId=1
+    ORDER BY VotesByAge2.OldVotes DESC
+    LIMIT 10
+  "
+  )
+  return(sqldf5)
+}
+
+Sqldf5()
+```
+
+I created a subroutine in base R that returns a logical vector *cond* to filter out posts with old votes only. One can imagine *temp5* as a three-dimensional table where for each *PostId*, we have a data frame containing a column of votes marked as "new" or "old".
+
+```{r base5, dependson = "data"}
+Base5 <- function() {
+  votesByAge <- Votes[Votes[, "VoteTypeId"] %in% c(1, 2, 5),
+                      c("PostId", "CreationDate")]
+  votesByAge["VoteDate"] <-
+    ifelse(substr(votesByAge[, "CreationDate"], 1, 4)
+           %in% c(2021, 2020), "new", "old")
+  votesByAge <- subset(votesByAge, select = -CreationDate)
+  votesByAge <- aggregate(votesByAge$PostId,
+                          by = list(votesByAge$PostId, votesByAge$VoteDate),
+                          length)
+  votesByAge <-
+    setNames(votesByAge, c("PostId", "VoteDate", "Total"))
+  
+  temp5 <- split(votesByAge, votesByAge$PostId)
+  cond <- sapply(temp5, function (x) {
+    df <- as.data.frame(x)
+    length(unique(df[, 2])) == 1 && df[, 2][1] == "old"
+  })
+  votesByAge2 <- do.call(rbind, temp5[cond])
+  votesByAge2 <- subset(votesByAge2, select = -VoteDate)
+  colnames(votesByAge2)[2] <- "OldVotes"
+  
+  base5 <- merge(votesByAge2, Posts, by.x = "PostId", by.y = "Id")
+  base5 <- base5[base5$PostTypeId == 1, c("Title", "OldVotes")]
+  base5 <-
+    head(base5[order(base5$OldVotes, decreasing = TRUE),], 10)
+  return(base5)
+}
+```
+
+In `dplyr`, the process of rewording the SQL query happened to be more straightforward.
+
+```{r dplyr5, dependson = "data"}
+Dplyr5 <- function() {
+  votesByAge <- Votes %>%
+    filter(VoteTypeId %in% c(1, 2, 5)) %>%
+    mutate(VoteDate = substr(CreationDate, 1, 4)) %>%
+    mutate(VoteDate = case_when(VoteDate %in% c(2021, 2020) ~ "new",
+                                TRUE ~ "old")) %>%
+    count(PostId, VoteDate, name = "Total")
+  
+  votesByAge2 <- votesByAge %>%
+    group_by(PostId) %>%
+    summarize(NewVotes = max(
+                case_when(VoteDate == "new" ~ Total, TRUE ~ 0L)),
+              OldVotes = max(
+                case_when(VoteDate == "old" ~ Total, TRUE ~ 0L))) %>%
+    filter(NewVotes == 0)
+  
+  dplyr5 <- Posts %>%
+    inner_join(votesByAge2, by = c("Id" = "PostId")) %>%
+    filter(PostTypeId == 1) %>%
+    select(Title, OldVotes) %>%
+    arrange(desc(OldVotes)) %>%
+    slice_head(n = 10)
+}
+```
+
+```{r dataTable5, dependson = "data"}
+DataTable5 <- function() {
+  votes <- as.data.table(Votes)
+  votesByAge <- votes[VoteTypeId %in% c(1, 2, 5), .(PostId, CreationDate)
+                      ][, .(PostId, VoteDate = ifelse(substr(
+                          CreationDate, 1, 4)
+                          %in% c(2021, 2020), "new", "old"))
+                        ][, .(Total = .N), by = .(PostId, VoteDate)
+                          ]
+  
+  votesByAge2 <- votesByAge[, .(PostId,
+                                NewVotes = ifelse(VoteDate == "new", Total, 0),
+                                OldVotes = ifelse(VoteDate == "old", Total, 0),
+                                Total)
+                            ][, .(NewVotes = max(NewVotes),
+                                  OldVotes = max(OldVotes)),
+                              by = PostId
+                              ][NewVotes == 0
+                                ]
+  setkey(votesByAge2, PostId)
+  
+  posts <- as.data.table(Posts)
+  setkey(posts, Id)
+  dataTable5 <- head(posts[votesByAge2
+                            ][PostTypeId == 1, .(Title, OldVotes)
+                              ][order(-OldVotes)
+                                ], 10)
+  dataTable5$OldVotes <- as.integer(dataTable5$OldVotes)
+  return(dataTable5)
+}
+```
+
+```{r eq5, dependson = c("areEquivalent", "sqldf5", "base5", "dplyr5", "dataTable5")}
+AreEquivalent(Sqldf5(), Base5(), Dplyr5(), DataTable5())
+```
+
+```{r exec5, dependson = c("sqldf5", "base5", "dplyr5", "dataTable5")}
+microbenchmark::microbenchmark(sqldf = Sqldf5(), base = Base5(),
+               dplyr = Dplyr5(), dataTable = DataTable5(), times = 10)
+```
+
+---
+
+## Conclusion
+
+To summarize, I obtained equivalent results using various tools that differ in design, grammar, and underlying data structures. In many cases, methods from the `data.table` package were the most efficient. In my opinion, though, clarity of intent is achieved better with `dplyr`. We see that its timings were on par with the `data.table` code except for the last query.
+
+Instead of mocking SQL syntax, I wrote the equivalent *Dplyr6* function based on conceptually the same idea.
+
+```{r dplyr6, dependson = "data"}
+Dplyr6 <- function() {
+  temp6 <- Votes %>%
+    filter(VoteTypeId %in% c(1, 2, 5)) %>%
+    mutate(VoteDate = substr(CreationDate, 1, 4) < 2020) %>%
+    group_by(PostId) %>%
+    filter(all(VoteDate)) %>%
+    add_tally(name = "OldVotes") %>%
+    distinct(PostId, OldVotes)
+  
+  dplyr6 <- Posts %>%
+    inner_join(temp6, by = c("Id" = "PostId")) %>%
+    filter(PostTypeId == 1) %>%
+    select(Title, OldVotes) %>%
+    arrange(desc(OldVotes)) %>%
+    slice_head(n = 10)
+  return(dplyr6)
+}
+```
+
+```{r eq6, dependson = c("sqldf5", "dplyr6")}
+all(all_equal(Sqldf5(), Dplyr6()),
+    compare::compare(Sqldf5(), Dplyr6(), allowAll = TRUE)$result)
+```
+
+Half of the code remained unchanged, but the relative performance benchmark demonstrates that the new function runs about nine times faster.
+
+```{r exec6, dependson = c("dplyr5", "dplyr6")}
+microbenchmark::microbenchmark(dplyr5 = Dplyr5(), dplyr6 = Dplyr6(),
+                               unit = "relative", times = 10)
+```
+
+There are no "good" or "bad" libraries. Writing code that is readable, efficient, and correct requires thorough thinking.
